@@ -41,6 +41,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # 0 will flush on every message.
   config :flush_interval, :validate => :number, :default => 2
 
+  config :buffer_size, :validate => :number, :default => 1048576
+
   # Gzip the output stream before writing to disk.
   config :gzip, :validate => :boolean, :default => false
 
@@ -140,7 +142,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
           fd.write(chunks.last)
         else
           # append to the file
-          chunks.each {|chunk| fd.write(chunk) }
+          fd.write(chunks.join(""))
         end
         fd.flush unless @flusher && @flusher.alive?
       end
@@ -249,19 +251,22 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
 
   private
   def open(path)
-    if !deleted?(path) && cached?(path)
+    if cached?(path)
       return @files[path]
     end
+    @files[path] = IOWriter.new(open_fd(path), @buffer_size, lambda { recreate(path) })
+  end
 
-    if deleted?(path)
-      if @create_if_deleted
-        @logger.debug("Required path was deleted, creating the file again", :path => path)
-        @files.delete(path)
-      else
-        return @files[path] if cached?(path)
-      end
+  private
+  def recreate(path)
+    if @create_if_deleted && deleted?(path)
+      @logger.debug("Required path was deleted, creating the file again", :path => path)
+      open_fd(path)
     end
+  end
 
+  private
+  def open_fd(path)
     @logger.info("Opening file", :path => path)
 
     dir = File.dirname(path)
@@ -288,7 +293,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     if gzip
       fd = Zlib::GzipWriter.new(fd)
     end
-    @files[path] = IOWriter.new(fd)
+    fd
   end
 
   ##
@@ -367,18 +372,68 @@ end # class LogStash::Outputs::File
 
 # wrapper class
 class IOWriter
-  def initialize(io)
+  def initialize(io, buffer_size, recreate)
     @io = io
+    @buffers = []
+    @size = 0
+    @limit = buffer_size
+    @recreate = recreate
   end
+
+  private
+  def reopen
+    fd = @recreate.call
+    if !(fd.nil?)
+      @io.flush
+      if @io.class == Zlib::GzipWriter
+        @io.to_io.flush
+      end
+      @io.close
+      @io = fd
+    end
+  end
+
+  public
   def write(*args)
-    @io.write(*args)
+    args.each do |arg|
+      @size += arg.bytesize
+      @buffers.push(arg)
+    end
+    if (@limit >= 0) and (@size > @limit)
+      do_write
+    end
     @active = true
   end
+
+  private
+  def do_write
+    if @size > 0
+      reopen
+      @io.write(@buffers.join(""))
+      @buffers = []
+      @size = 0
+    end
+  end
+
+  public
   def flush
+    do_write
     @io.flush
     if @io.class == Zlib::GzipWriter
       @io.to_io.flush
     end
+  end
+
+  public
+  def truncate(length)
+    reopen
+    @io.truncate(length)
+  end
+
+  public
+  def close
+    flush
+    @io.close
   end
   def method_missing(method_name, *args, &block)
     if @io.respond_to?(method_name)
