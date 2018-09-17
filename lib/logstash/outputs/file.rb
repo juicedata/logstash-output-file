@@ -207,10 +207,10 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # the back-bone of @flusher, our periodic-flushing interval.
   private
   def flush_pending_files
-    @io_mutex.synchronize do
+    pending_files = @io_mutex.synchronize do
       @logger.debug("Starting flush cycle")
       # flushing all the files is slow, so we should do that without blocking
-      pending_files = @files.clone
+      @files.clone
     end
     pending_files.each do |path, fd|
       @logger.debug("Flushing file", :path => path, :fd => fd)
